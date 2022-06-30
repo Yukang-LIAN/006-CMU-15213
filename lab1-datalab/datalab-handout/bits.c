@@ -283,7 +283,18 @@ int howManyBits(int x) {
  *   Max ops: 30
  *   Rating: 4
  */
-unsigned floatScale2(unsigned uf) { return 2; }
+unsigned floatScale2(unsigned uf) {
+  int exp = (uf & 0x7fffffff) >> 23;
+  int sign = uf >> 31;
+  if (exp == 0)
+    return (uf << 1) + (sign << 31);
+  if (exp == 255)
+    return uf;
+  exp = exp + 1;
+  if (exp == 255)
+    return 0x7f800000 + (sign << 31);
+  return (exp << 23) | (uf & 0x807fffff);
+}
 /*
  * floatFloat2Int - Return bit-level equivalent of expression (int) f
  *   for floating point argument f.
