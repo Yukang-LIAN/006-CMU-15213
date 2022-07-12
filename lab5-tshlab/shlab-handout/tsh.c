@@ -13,6 +13,16 @@
 #include <sys/wait.h>
 #include <errno.h>
 
+// set 1 for printing debug info
+// debug开启标识，编译前将其手动置为1
+#define DEBUG 0
+// do { ... } while (0) idiom ensures that the code acts like a statement
+// 在代码中需要打印信息的地方 使用 debug_println 宏来进行打印
+#define debug_println(fmt, ...)                                                \
+  do {                                                                         \
+    if (DEBUG)                                                                 \
+      fprintf(stderr, fmt "\n", __VA_ARGS__);                                  \
+  } while (0)
 /* Misc manifest constants */
 #define MAXLINE    1024   /* max line size */
 #define MAXARGS     128   /* max args on a command line */
@@ -84,6 +94,7 @@ void unix_error(char *msg);
 void app_error(char *msg);
 typedef void handler_t(int);
 handler_t *Signal(int signum, handler_t *handler);
+pid_t Fork(void);
 
 /*
  * main - The shell's main routine 
@@ -165,6 +176,57 @@ int main(int argc, char **argv)
 */
 void eval(char *cmdline) 
 {
+     char *argv[MAXARGS]; // 所有参数
+  int bg;              // 最后是否是&，即是否后台执行，
+  pid_t pid;           // Process id
+
+  bg = parseline(cmdline, argv);
+  if (argv[0] == NULL) {
+    return;
+  }
+  // 这么写是因为 builtin_cmd 原始定义就希望通过返回值来判断是否
+  // 是执行 builtin cmd 的
+  if (!builtin_cmd(argv)) {
+    sigset_t mask_all, mask_one, prev_one; // 屏蔽信号，见 code 8-40
+    sigfillset(&mask_all);
+    sigemptyset(&mask_one);
+    sigaddset(&mask_one, SIGCHLD);
+
+    // 在 fork 子进程前 一定要 屏蔽 SIGCHLD 信号
+    sigprocmask(SIG_BLOCK, &mask_one, &prev_one);
+    if ((pid = Fork()) == 0) { /* Child runs user job */
+      // 与父进程的 process group 区分开
+      // 防止 ctrl-c ctrl-z 的失败
+      // 这么做还可以使得子进程的 process id 和 process group id 相同
+      setpgid(0, 0);
+      // fork 结束之后 在子进程 exec 程序之前 必须解除 SIGCHLD 信号屏蔽
+      sigprocmask(SIG_SETMASK, &prev_one, NULL);
+      // load path & exec
+      // 用这个最方便，因为 parseline 拿到到 argv 形式和
+      // execvp 方法调用很相似
+      if (execvp(argv[0], argv) < 0) {
+        // exec 程序成功运行后 会替换原有函数栈，也就是说，下面的代码
+        // 在正常的时候不会被执行
+        printf("%s: Command not found\n", argv[0]);
+        exit(0);
+      }
+    }
+
+    // 父进程屏蔽 所有 信号
+    sigprocmask(SIG_BLOCK, &mask_all, NULL);
+
+    /* Parent waits for foreground job to terminate */
+    if (!bg) {
+      // 前台时不解除 所有 信号 的屏蔽
+      addjob(jobs, pid, FG, cmdline);
+      waitfg(pid);
+    } else {
+      // 解除信号屏蔽
+      addjob(jobs, pid, BG, cmdline);
+      sigprocmask(SIG_SETMASK, &prev_one, NULL);
+      printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
+    }
+  }
     return;
 }
 
@@ -231,6 +293,23 @@ int parseline(const char *cmdline, char **argv)
  */
 int builtin_cmd(char **argv) 
 {
+     if (strcmp(argv[0], "quit") == 0) {
+    exit(0);
+  }
+  if (strcmp(argv[0], "jobs") == 0) {
+    // jobs handler
+    listjobs(jobs);
+    return 1;
+  }
+  if (strcmp(argv[0], "&") == 0) {
+    // ignore singleton '&'
+    return 1;
+  }
+  if (strcmp(argv[0], "bg") == 0 || strcmp(argv[0], "fg") == 0) {
+    // FG & BG
+    do_bgfg(argv);
+    return 1;
+  }
     return 0;     /* not a builtin command */
 }
 
@@ -239,6 +318,47 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {
+    struct job_t *job_ptr;
+  pid_t jobid;
+  pid_t pid;
+
+  // bg job 给后台 job 发送 SIGCONT 信号来继续执行该任务
+  // fg job 给前台 job 发送 SIGCONT 信号来继续执行该任务
+  if (argv[1] == NULL) {
+    printf("%s command requires PID or %%jobid argument\n", argv[0]);
+    return;
+  }
+  if ((argv[1][0] < '0' || argv[1][0] > '9') && argv[1][0] != '%') {
+    printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+    return;
+  }
+
+  // 获取id参数
+  if (argv[1][0] == '%') {
+    jobid = atoi(argv[1] + 1);
+    job_ptr = getjobjid(jobs, jobid);
+    if (job_ptr == NULL) {
+      printf("%s: No such job\n", argv[1]);
+      return;
+    }
+  } else {
+    pid = atoi(argv[1]);
+    job_ptr = getjobpid(jobs, pid);
+    if (job_ptr == NULL) {
+      printf("(%s): No such process\n", argv[1]);
+      return;
+    }
+  }
+  // 发送信号
+  kill(-(job_ptr->pid), SIGCONT);
+  // 更改状态
+  if (strcmp(argv[0], "fg") == 0) {
+    job_ptr->state = FG;
+    waitfg(job_ptr->pid);
+  } else {
+    job_ptr->state = BG;
+    printf("[%d] (%d) %s", job_ptr->jid, job_ptr->pid, job_ptr->cmdline);
+  }
     return;
 }
 
@@ -247,6 +367,16 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
+    sigset_t mask;
+  sigemptyset(&mask);
+  debug_println("[waitfg before loop] waitfg pid: %d", pid);
+  while (pid == fgpid(jobs)) {
+    debug_println("[waitfg in loop] waitfg pid: %d", pid);
+    sigsuspend(&mask);
+  }
+  // eval 中父进程阻塞了所有信号，在这里释放
+  sigprocmask(SIG_SETMASK, &mask, NULL);
+  debug_println("[waitfg after loop] waitfg pid: %d", pid);
     return;
 }
 
@@ -263,6 +393,55 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
+    // 相似代码可见 CSAPP edition-3 8-37 exercise 8.8
+  int olderrno = errno;
+  sigset_t mask_all, prev_all;
+  pid_t pid;
+  int status;
+
+  // 信号阻塞
+  sigfillset(&mask_all);
+  debug_println("[handle chld] sig: %d", sig);
+  // 立即返回（WNOHANG|WUNTRACED） 见 8.4.3 回收子进程
+  while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+    debug_println("[handle chld] in loop pid: %d", pid);
+    if (WIFEXITED(status)) {
+      // 正常退出
+      debug_println("[chld hand] pid: %d", pid);
+      sigprocmask(SIG_BLOCK, &mask_all,
+                  &prev_all); // 用来同步进程 见 CSAPP edition-3 8-40
+      deletejob(jobs, pid);
+      sigprocmask(SIG_SETMASK, &prev_all, NULL);
+      struct job_t *job_ptr = getjobpid(jobs, pid);
+      if (job_ptr == NULL) {
+        debug_println("[chld hand] after delete, job_ptr is NULL %d", 0);
+      } else {
+        debug_println("[chld hand] after delete, jobpid: [%d] (%d)",
+                      job_ptr->jid, job_ptr->pid);
+      }
+
+    } else if (WIFSIGNALED(status)) {
+      // 进程异常终止
+      struct job_t *job_ptr = getjobpid(jobs, pid);
+      // 理论上来讲 这里的 printf 是不安全的
+      printf("Job [%d] (%d) terminated by signal %d\n", job_ptr->jid,
+             job_ptr->pid, WTERMSIG(status));
+      sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+      deletejob(jobs, pid);
+      sigprocmask(SIG_SETMASK, &prev_all, NULL);
+    } else {
+      // stop 而非 terminated
+      struct job_t *job_ptr = getjobpid(jobs, pid);
+      // 理论上来讲 这里的 printf 是不安全的
+      printf("Job [%d] (%d) stopped by signal %d\n", job_ptr->jid, job_ptr->pid,
+             WSTOPSIG(status));
+      sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+      job_ptr->state = ST;
+      sigprocmask(SIG_SETMASK, &prev_all, NULL);
+    }
+  }
+
+  errno = olderrno;
     return;
 }
 
@@ -273,6 +452,13 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
+     pid_t pid = fgpid(jobs);
+  debug_println("[INT handl] get INT sig: %d", sig);
+  debug_println("[INT handl] pid: %d", pid);
+  // -pid 表示发给这个进程组的每个进程
+  if (pid != 0 && kill(-pid, SIGINT) < 0)
+    unix_error("sigint_handler: kill");
+  return;
     return;
 }
 
@@ -283,6 +469,12 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+    pid_t pid = fgpid(jobs);
+  debug_println("[STP handl] get STP sig: %d", sig);
+  debug_println("[STP handl] pid: %d", pid);
+  // -pid 表示发给这个进程组的每个进程
+  if (-pid != 0 && kill(-pid, SIGTSTP) < 0)
+    unix_error("sigtstp_handler: kill");
     return;
 }
 
@@ -503,6 +695,14 @@ void sigquit_handler(int sig)
 {
     printf("Terminating after receipt of SIGQUIT signal\n");
     exit(1);
+}
+
+pid_t Fork(void) {
+  pid_t pid;
+  if ((pid = fork()) < 0) {
+    unix_error("Fork error");
+  }
+  return pid;
 }
 
 
